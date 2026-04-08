@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  nexcart:
+    image: nexcart-app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=file:./prisma/dev.db
+      - NEXTAUTH_URL=http://localhost:3000
+      - NEXTAUTH_SECRET=changeme_in_production
+    volumes:
+      - db-data:/app/prisma
+    restart: always
+    networks:
+      - nexcart-net
+
+  playwright-tests:
+    image: nexcart-playwright
+    build:
+      context: ./playwright-framework
+      dockerfile: Dockerfile
+    depends_on:
+      - nexcart
+    environment:
+      - BASE_URL=http://nexcart:3000
+      - AI_PROVIDER=${AI_PROVIDER:-openrouter}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+    volumes:
+      - ./playwright-framework/src/healing/HealingCache.json:/work/src/healing/HealingCache.json
+      - ./playwright-framework/test-results:/work/test-results
+    networks:
+      - nexcart-net
+
+networks:
+  nexcart-net:
+    driver: bridge
+
+volumes:
+  db-data:
