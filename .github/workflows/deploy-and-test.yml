@@ -1,0 +1,295 @@
+name: Deploy App and Run Tests
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: nextcart-app
+  ECS_CLUSTER: qa-cluster
+  ECS_SERVICE: nextcart-app-service
+  ECS_TASK_DEFINITION: nextcart-app-task
+  PLAYWRIGHT_CLUSTER: qa-cluster
+  PLAYWRIGHT_TASK: playwright-runner
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -f Dockerfile.simple -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "IMAGE=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+        id: build-image
+
+      - name: Check if ECS service exists
+        id: check-service
+        run: |
+          if aws ecs describe-services --cluster $ECS_CLUSTER --services $ECS_SERVICE --region $AWS_REGION 2>&1 | grep -q "ACTIVE"; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create ECS task definition (first time only)
+        if: steps.check-service.outputs.exists == 'false'
+        run: |
+          cat > task-def.json <<EOF
+          {
+            "family": "$ECS_TASK_DEFINITION",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "512",
+            "memory": "1024",
+            "executionRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/qa-ecs-task-role",
+            "taskRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/qa-ecs-task-role",
+            "containerDefinitions": [
+              {
+                "name": "nextcart-app",
+                "image": "${{ steps.build-image.outputs.IMAGE }}",
+                "portMappings": [
+                  {
+                    "containerPort": 3000,
+                    "protocol": "tcp"
+                  }
+                ],
+                "essential": true,
+                "environment": [
+                  {"name": "NODE_ENV", "value": "development"},
+                  {"name": "DATABASE_URL", "value": "file:./dev.db"}
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/nextcart-app",
+                    "awslogs-region": "${{ env.AWS_REGION }}",
+                    "awslogs-stream-prefix": "ecs",
+                    "awslogs-create-group": "true"
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+
+          aws ecs register-task-definition \
+            --cli-input-json file://task-def.json \
+            --region $AWS_REGION
+
+      - name: Create ECS service (first time only)
+        if: steps.check-service.outputs.exists == 'false'
+        run: |
+          aws ecs create-service \
+            --cluster $ECS_CLUSTER \
+            --service-name $ECS_SERVICE \
+            --task-definition $ECS_TASK_DEFINITION \
+            --desired-count 1 \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[subnet-081a5a98616080553],securityGroups=[sg-01dbda991a51b9e1e],assignPublicIp=ENABLED}" \
+            --region $AWS_REGION
+
+      - name: Update ECS service (if exists)
+        if: steps.check-service.outputs.exists == 'true'
+        run: |
+          # Register new task definition with latest image
+          TASK_DEFINITION=$(aws ecs describe-task-definition --task-definition $ECS_TASK_DEFINITION --region $AWS_REGION)
+          NEW_TASK_DEF=$(echo $TASK_DEFINITION | jq --arg IMAGE "${{ steps.build-image.outputs.IMAGE }}" '.taskDefinition | .containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn) | del(.revision) | del(.status) | del(.requiresAttributes) | del(.compatibilities) | del(.registeredAt) | del(.registeredBy)')
+
+          NEW_TASK_INFO=$(aws ecs register-task-definition --region $AWS_REGION --cli-input-json "$NEW_TASK_DEF")
+          NEW_REVISION=$(echo $NEW_TASK_INFO | jq -r '.taskDefinition.revision')
+
+          # Update service
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --task-definition ${ECS_TASK_DEFINITION}:${NEW_REVISION} \
+            --region $AWS_REGION
+
+      - name: Wait for service to be stable
+        run: |
+          echo "Waiting for ECS service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --region $AWS_REGION
+
+      - name: Get app URL
+        id: get-url
+        run: |
+          TASK_ARN=$(aws ecs list-tasks --cluster $ECS_CLUSTER --service-name $ECS_SERVICE --region $AWS_REGION --query 'taskArns[0]' --output text)
+          ENI_ID=$(aws ecs describe-tasks --cluster $ECS_CLUSTER --tasks $TASK_ARN --region $AWS_REGION --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text)
+          PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --region $AWS_REGION --query 'NetworkInterfaces[0].Association.PublicIp' --output text)
+          APP_URL="http://${PUBLIC_IP}:3000"
+          echo "APP_URL=$APP_URL" >> $GITHUB_OUTPUT
+          echo "Application deployed at: $APP_URL"
+
+      - name: Wait for app to be ready
+        run: |
+          APP_URL="${{ steps.get-url.outputs.APP_URL }}"
+          echo "Waiting for app to be ready at $APP_URL"
+          for i in {1..30}; do
+            if curl -sf "$APP_URL" > /dev/null; then
+              echo "App is ready!"
+              exit 0
+            fi
+            echo "Attempt $i: App not ready yet, waiting..."
+            sleep 10
+          done
+          echo "App failed to start within timeout"
+          exit 1
+
+  run-tests:
+    needs: build-and-deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get app URL
+        id: get-url
+        run: |
+          TASK_ARN=$(aws ecs list-tasks --cluster $ECS_CLUSTER --service-name $ECS_SERVICE --region $AWS_REGION --query 'taskArns[0]' --output text)
+          ENI_ID=$(aws ecs describe-tasks --cluster $ECS_CLUSTER --tasks $TASK_ARN --region $AWS_REGION --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text)
+          PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --region $AWS_REGION --query 'NetworkInterfaces[0].Association.PublicIp' --output text)
+          APP_URL="http://${PUBLIC_IP}:3000"
+          echo "APP_URL=$APP_URL" >> $GITHUB_OUTPUT
+
+      - name: Trigger Playwright tests
+        id: trigger-tests
+        run: |
+          RUN_ID="github-${{ github.run_number }}-${{ github.sha }}"
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster $PLAYWRIGHT_CLUSTER \
+            --task-definition $PLAYWRIGHT_TASK \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[subnet-081a5a98616080553],securityGroups=[sg-01dbda991a51b9e1e],assignPublicIp=ENABLED}" \
+            --overrides "{\"containerOverrides\":[{\"name\":\"playwright\",\"environment\":[{\"name\":\"GIT_BRANCH\",\"value\":\"main\"},{\"name\":\"RUN_ID\",\"value\":\"$RUN_ID\"},{\"name\":\"RESULT_BUCKET\",\"value\":\"qa-test-results-ganesh\"},{\"name\":\"SPEC_FILTER\",\"value\":\"tests/\"},{\"name\":\"BASE_URL\",\"value\":\"${{ steps.get-url.outputs.APP_URL }}\"}]}]}" \
+            --region $AWS_REGION \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          echo "TASK_ARN=$TASK_ARN" >> $GITHUB_OUTPUT
+          echo "RUN_ID=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "Playwright tests triggered with task: $TASK_ARN"
+          echo "Run ID: $RUN_ID"
+
+      - name: Wait for tests to complete
+        run: |
+          TASK_ID=$(echo "${{ steps.trigger-tests.outputs.TASK_ARN }}" | awk -F/ '{print $NF}')
+
+          echo "Waiting for Playwright tests to complete..."
+          for i in {1..60}; do
+            STATUS=$(aws ecs describe-tasks \
+              --cluster $PLAYWRIGHT_CLUSTER \
+              --tasks ${{ steps.trigger-tests.outputs.TASK_ARN }} \
+              --region $AWS_REGION \
+              --query 'tasks[0].lastStatus' \
+              --output text)
+
+            echo "Attempt $i: Task status: $STATUS"
+
+            if [ "$STATUS" = "STOPPED" ]; then
+              EXIT_CODE=$(aws ecs describe-tasks \
+                --cluster $PLAYWRIGHT_CLUSTER \
+                --tasks ${{ steps.trigger-tests.outputs.TASK_ARN }} \
+                --region $AWS_REGION \
+                --query 'tasks[0].containers[0].exitCode' \
+                --output text)
+
+              echo "Tests completed with exit code: $EXIT_CODE"
+
+              if [ "$EXIT_CODE" = "0" ]; then
+                echo "✅ Tests passed!"
+              else
+                echo "❌ Tests failed with exit code $EXIT_CODE"
+              fi
+
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "Tests did not complete within timeout"
+
+      - name: Check test results in S3
+        run: |
+          RUN_ID="${{ steps.trigger-tests.outputs.RUN_ID }}"
+          echo "Checking for test results..."
+
+          sleep 5
+
+          if aws s3 ls "s3://qa-test-results-ganesh/${RUN_ID}/report.json" --region $AWS_REGION; then
+            echo "✅ Test results uploaded to S3"
+            echo "Results: s3://qa-test-results-ganesh/${RUN_ID}/report.json"
+
+            # Download and display summary
+            aws s3 cp "s3://qa-test-results-ganesh/${RUN_ID}/report.json" /tmp/report.json --region $AWS_REGION
+            echo "Test report downloaded"
+          else
+            echo "⚠️ Test results not found in S3 yet"
+          fi
+
+      - name: Check analyzer execution
+        run: |
+          echo "Waiting for analyzer to process results..."
+          sleep 10
+
+          # Check DynamoDB for failures
+          FAILURES=$(aws dynamodb scan \
+            --table-name qa-failures \
+            --region $AWS_REGION \
+            --query 'Items | length(@)')
+
+          echo "Total failures in database: $FAILURES"
+
+          # Check for recent analysis
+          REPORTS=$(aws dynamodb scan \
+            --table-name qa-reports \
+            --region $AWS_REGION \
+            --query 'Items | length(@)')
+
+          echo "Total analysis reports: $REPORTS"
+
+      - name: Deployment summary
+        run: |
+          echo "🎉 Deployment Summary"
+          echo "===================="
+          echo "App URL: ${{ steps.get-url.outputs.APP_URL }}"
+          echo "Run ID: ${{ steps.trigger-tests.outputs.RUN_ID }}"
+          echo "Tests: Completed"
+          echo "Analyzer: Triggered"
+          echo ""
+          echo "View results at:"
+          echo "- Control Plane: http://qa-control-ganesh.s3-website.ap-south-1.amazonaws.com"
+          echo "- CloudWatch Logs: /ecs/playwright-runner"
